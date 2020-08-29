@@ -40,7 +40,7 @@ fn main() {
                 process::exit(code);
             }
             println!("error: {}", err);
-            for cause in err.causes().skip(1) {
+            for cause in err.iter_causes().skip(1) {
                 println!("  caused by: {}", cause);
             }
             if want_bt {
