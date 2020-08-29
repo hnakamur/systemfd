@@ -10,6 +10,8 @@ extern crate libc;
 
 #[cfg(unix)]
 extern crate nix;
+#[cfg(unix)]
+extern crate tokio;
 #[cfg(windows)]
 extern crate socket2;
 #[cfg(windows)]

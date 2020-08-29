@@ -1,27 +1,94 @@
-use std::process::Command;
-
 use failure::Error;
 
-use fd::{Fd, RawFd};
+use crate::fd::{Fd, RawFd};
 
 #[cfg(unix)]
 mod imp {
     use super::*;
-    use nix::unistd::getpid;
-    use std::os::unix::process::CommandExt;
+    use nix::fcntl::{fcntl, FcntlArg, FdFlag};
+    use nix::sys::signal::{kill, Signal, SIGTERM};
+    use nix::unistd::{getpid, Pid};
+    use std::convert::TryInto;
+    use tokio::process::{Child, Command};
+    use tokio::signal::unix::{signal, SignalKind};
+    use tokio::stream::StreamExt;
 
-    pub fn spawn(raw_fds: Vec<(Fd, RawFd)>, cmdline: &[&str], no_pid: bool) -> Result<(), Error> {
+    fn share_listeners(raw_fds: &[(Fd, RawFd)]) -> Result<(), Error> {
+        for &(_, raw_fd) in raw_fds {
+            let flags = fcntl(raw_fd, FcntlArg::F_GETFD)?;
+            let mut fdflags = FdFlag::from_bits_truncate(flags);
+            fdflags.remove(FdFlag::FD_CLOEXEC);
+            fcntl(raw_fd, FcntlArg::F_SETFD(fdflags))?;
+            println!("fcntl OK for raw_fd={}, fdflags={:?}", raw_fd, fdflags);
+
+            println!("fcntl F_GETFD again, flags={}", fcntl(raw_fd, FcntlArg::F_GETFD)?);
+        }
+        Ok(())
+    }
+
+    fn spawn_child(
+        raw_fds: &[(Fd, RawFd)],
+        cmdline: &[&str],
+        no_pid: bool,
+    ) -> Result<Child, Error> {
         let mut cmd = Command::new(&cmdline[0]);
         cmd.args(&cmdline[1..]);
 
         if !raw_fds.is_empty() {
             cmd.env("LISTEN_FDS", raw_fds.len().to_string());
+            println!("set LISTEN_FDS to {}", raw_fds.len());
             if !no_pid {
                 cmd.env("LISTEN_PID", getpid().to_string());
             }
         }
-        cmd.exec();
-        unreachable!();
+        cmd.spawn().map_err(Error::from)
+    }
+
+    fn send_signal(child: &Child, sig: Signal) -> Result<(), Error> {
+        kill(Pid::from_raw(child.id().try_into().unwrap()), sig).map_err(Error::from)
+    }
+
+    pub fn spawn(raw_fds: Vec<(Fd, RawFd)>, cmdline: &[&str], no_pid: bool) -> Result<(), Error> {
+        share_listeners(&raw_fds)?;
+
+        tokio::runtime::Builder::new()
+            .threaded_scheduler()
+            .core_threads(2)
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let mut child = spawn_child(&raw_fds, cmdline, no_pid).expect("failed to create child process");
+                println!("spawn_child OK, child={:?}", child);
+
+                let mut hangup_stream = signal(SignalKind::hangup()).expect("cannot get signal hangup");
+                let mut terminate_stream =
+                    signal(SignalKind::terminate()).expect("cannot get signal terminal");
+                let mut user_defined2_stream =
+                    signal(SignalKind::user_defined2()).expect("cannot get signal user_defined2");
+
+                loop {
+                    tokio::select! {
+                        _ = hangup_stream.next() => {
+                            println!("got signal HUP");
+                        }
+                        _ = terminate_stream.next() => {
+                            println!("got signal TERM");
+                            send_signal(&child, SIGTERM).expect("send SIGTERM to child");
+                            break;
+                        }
+                        _ = user_defined2_stream.next() => {
+                            println!("got signal USR2");
+                            let new_child = spawn_child(&raw_fds, cmdline, no_pid).expect("failed to create new child process");
+                            send_signal(&child, SIGTERM).expect("send SIGTERM to old child");
+                            let status = child.await.expect("child process status");
+                            println!("child process exit status={}", status);
+                            child = new_child;
+                        }
+                    }
+                }
+            });
+        Ok(())
     }
 }
 
@@ -31,6 +98,7 @@ mod imp {
     use std::io::{Read, Write};
     use std::mem;
     use std::net::{TcpListener, TcpStream};
+    use std::process::Command;
     use std::slice;
     use std::thread;
 
