@@ -6,7 +6,7 @@ use crate::fd::{Fd, RawFd};
 mod imp {
     use super::*;
     use nix::fcntl::{fcntl, FcntlArg, FdFlag};
-    use nix::sys::signal::{kill, Signal, SIGTERM};
+    use nix::sys::signal::{kill, Signal, SIGHUP, SIGTERM};
     use nix::unistd::{getpid, Pid};
     use std::convert::TryInto;
     use tokio::process::{Child, Command};
@@ -19,9 +19,6 @@ mod imp {
             let mut fdflags = FdFlag::from_bits_truncate(flags);
             fdflags.remove(FdFlag::FD_CLOEXEC);
             fcntl(raw_fd, FcntlArg::F_SETFD(fdflags))?;
-            println!("fcntl OK for raw_fd={}, fdflags={:?}", raw_fd, fdflags);
-
-            println!("fcntl F_GETFD again, flags={}", fcntl(raw_fd, FcntlArg::F_GETFD)?);
         }
         Ok(())
     }
@@ -36,7 +33,6 @@ mod imp {
 
         if !raw_fds.is_empty() {
             cmd.env("LISTEN_FDS", raw_fds.len().to_string());
-            println!("set LISTEN_FDS to {}", raw_fds.len());
             if !no_pid {
                 cmd.env("LISTEN_PID", getpid().to_string());
             }
@@ -53,13 +49,12 @@ mod imp {
 
         tokio::runtime::Builder::new()
             .threaded_scheduler()
-            .core_threads(2)
+            .core_threads(num_cpus::get())
             .enable_all()
             .build()
             .unwrap()
             .block_on(async {
                 let mut child = spawn_child(&raw_fds, cmdline, no_pid).expect("failed to create child process");
-                println!("spawn_child OK, child={:?}", child);
 
                 let mut hangup_stream = signal(SignalKind::hangup()).expect("cannot get signal hangup");
                 let mut terminate_stream =
@@ -71,6 +66,7 @@ mod imp {
                     tokio::select! {
                         _ = hangup_stream.next() => {
                             println!("got signal HUP");
+                            send_signal(&child, SIGHUP).expect("send SIGHUP to child");
                         }
                         _ = terminate_stream.next() => {
                             println!("got signal TERM");
